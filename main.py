@@ -1,5 +1,18 @@
-import os
+# === Auto-install Required Packages ===
+import subprocess
 import sys
+
+required_packages = ['instaloader', 'python-dotenv', 'pytelegrambotapi', 'flask']
+
+for package in required_packages:
+    try:
+        __import__(package if package != 'python-dotenv' else 'dotenv')
+    except ImportError:
+        print(f"Installing missing package: {package}")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+
+# === Main Bot Code ===
+import os
 import random
 import logging
 import re
@@ -280,4 +293,4 @@ if __name__ == "__main__":
     logging.info("Bot started.")
     t = Thread(target=start_polling)
     t.start()
-    t.join()  # Prevents container from exiting
+    t.join()
