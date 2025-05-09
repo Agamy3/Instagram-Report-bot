@@ -1,18 +1,5 @@
-# === Auto-install Required Packages ===
-import subprocess
-import sys
-
-required_packages = ['instaloader', 'python-dotenv', 'pytelegrambotapi', 'flask']
-
-for package in required_packages:
-    try:
-        __import__(package if package != 'python-dotenv' else 'dotenv')
-    except ImportError:
-        print(f"Installing missing package: {package}")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", package])
-
-# === Main Bot Code ===
 import os
+import sys
 import random
 import logging
 import re
@@ -53,7 +40,7 @@ FORCE_JOIN_CHANNEL = os.getenv("FORCE_JOIN_CHANNEL")
 ADMIN_ID = os.getenv("ADMIN_ID")
 
 bot = telebot.TeleBot(API_TOKEN)
-bot.remove_webhook()
+bot.remove_webhook()  # Clear webhook if previously set (ensure polling mode)
 
 # In-memory user storage
 user_ids = set()
@@ -84,10 +71,7 @@ def check_keywords(text, keywords):
 
 def analyze_profile(profile_info):
     reports = defaultdict(int)
-    profile_texts = [
-        profile_info.get("username", ""),
-        profile_info.get("biography", ""),
-    ]
+    profile_texts = [profile_info.get("username", ""), profile_info.get("biography", "")]
 
     for text in profile_texts:
         for category, keywords in report_keywords.items():
@@ -281,16 +265,8 @@ def help_callback(call):
     bot.answer_callback_query(call.id, text=help_text)
     bot.send_message(call.from_user.id, help_text, parse_mode='MarkdownV2')
 
-# === Keep Bot Running ===
-def start_polling():
-    try:
-        bot.polling(none_stop=True)
-    except Exception as e:
-        logging.error(f"Polling error: {e}")
-
+# === Start Polling (main entry point) ===
 if __name__ == "__main__":
     print("Starting the bot...")
     logging.info("Bot started.")
-    t = Thread(target=start_polling)
-    t.start()
-    t.join()
+    bot.polling(none_stop=True)
