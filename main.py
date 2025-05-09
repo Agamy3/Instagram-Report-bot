@@ -45,29 +45,29 @@ ADMIN_ID = os.getenv("ADMIN_ID")
 INSTAGRAM_USER = os.getenv("INSTAGRAM_USERNAME")
 INSTAGRAM_PASS = os.getenv("INSTAGRAM_PASSWORD")
 
-# Initialize bot with file storage to prevent conflicts
+# Initialize bot
 bot = telebot.TeleBot(API_TOKEN, num_threads=1)
 bot.remove_webhook()
 
-# Custom rate controller
-class CustomRateController:
-    def __init__(self, controller):
-        self._controller = controller
+# Proper RateController implementation
+class CustomRateController(instaloader.RateController):
+    def __init__(self, context):
+        super().__init__(context)
         self.last_request = 0
         self.lock = Lock()
 
-    def sleep(self, secs):
+    def wait_before_query(self, query_type):
         with self.lock:
+            min_wait = 5  # Minimum seconds between requests
             elapsed = time.time() - self.last_request
-            if elapsed < secs:
-                time.sleep(secs - elapsed)
+            if elapsed < min_wait:
+                time.sleep(min_wait - elapsed)
             self.last_request = time.time()
 
-# Instagram manager class
+# Instagram manager
 class InstagramManager:
     def __init__(self):
         self.lock = Lock()
-        self.last_request = 0
         self.login_status = False
         self.login_attempts = 0
         self.last_error = None
@@ -79,38 +79,35 @@ class InstagramManager:
                 self.loader = instaloader.Instaloader(
                     max_connection_attempts=1,
                     request_timeout=60,
-                    sleep=True,
-                    rate_controller=lambda x: CustomRateController(x)
+                    rate_controller=CustomRateController
                 )
 
                 if INSTAGRAM_USER and INSTAGRAM_PASS:
                     self._attempt_login()
                 else:
-                    logging.info("Instagram: Running in anonymous mode")
+                    logging.info("Running in anonymous mode")
                     self.login_status = False
-
                 return True
             except Exception as e:
                 self.last_error = str(e)
-                logging.error(f"Instagram init failed: {e}")
+                logging.error(f"Initialization failed: {e}")
                 return False
 
     def _attempt_login(self):
         try:
             if self.login_attempts >= 3:
-                logging.warning("Too many login attempts, staying anonymous")
+                logging.warning("Too many login attempts")
                 return False
 
             self.loader.login(INSTAGRAM_USER, INSTAGRAM_PASS)
             self.login_status = True
-            self.login_attempts = 0
-            logging.info("Instagram login successful")
+            logging.info("Login successful")
             return True
         except Exception as e:
             self.login_status = False
             self.login_attempts += 1
             self.last_error = str(e)
-            logging.error(f"Instagram login failed (attempt {self.login_attempts}): {e}")
+            logging.error(f"Login failed (attempt {self.login_attempts}): {e}")
             return False
 
     def get_profile(self, username):
@@ -123,13 +120,7 @@ class InstagramManager:
                 return None
 
             try:
-                elapsed = time.time() - self.last_request
-                if elapsed < 5:
-                    time.sleep(5 - elapsed)
-
                 profile = instaloader.Profile.from_username(self.loader.context, username)
-                self.last_request = time.time()
-
                 return {
                     "username": profile.username,
                     "name": profile.full_name,
@@ -140,11 +131,9 @@ class InstagramManager:
                     "posts": profile.mediacount,
                     "url": f"https://instagram.com/{profile.username}"
                 }
-            except instaloader.exceptions.ProfileNotExistsException:
-                return None
             except Exception as e:
                 self.last_error = str(e)
-                logging.error(f"Profile fetch error: {e}")
+                logging.error(f"Profile error: {e}")
                 return None
 
     def get_status(self):
@@ -155,10 +144,10 @@ class InstagramManager:
             "anonymous": not (INSTAGRAM_USER and INSTAGRAM_PASS)
         }
 
-# Initialize Instagram manager
+# Initialize Instagram
 instagram = InstagramManager()
 if not instagram.initialize():
-    logging.error("Failed to initialize Instagram connection")
+    logging.error("Instagram initialization failed")
 
 # User storage
 user_storage = set()
@@ -185,12 +174,12 @@ report_categories = {
 }
 
 def analyze_text(text):
-    results = {}
     text = (text or "").lower()
+    results = {}
     for category, terms in report_categories.items():
         if any(term in text for term in terms):
             results[category] = random.randint(1, 5)
-    return results or {k: random.randint(1, 3) for k in random.sample(list(report_categories.keys()), 3)}
+    return results or {random.choice(list(report_categories.keys())): 1}
 
 # Telegram handlers
 @bot.message_handler(commands=['start'])
@@ -207,7 +196,7 @@ def start_cmd(message):
         return
 
     add_user(user_id)
-    bot.reply_to(message, "Welcome! Send /analyze username to check an Instagram profile")
+    bot.reply_to(message, "Welcome! Send /analyze username to check Instagram profiles")
 
 @bot.message_handler(commands=['analyze', 'getmeth'])
 def analyze_cmd(message):
@@ -217,40 +206,21 @@ def analyze_cmd(message):
         return
 
     username = ' '.join(args[1:])
-    msg = bot.reply_to(message, f"🔍 Scanning @{username}...")
-
-    status = instagram.get_status()
-    if not status['anonymous'] and not status['logged_in'] and status['attempts'] >= 3:
-        bot.edit_message_text(
-            "⚠️ Instagram login failed multiple times. Using limited anonymous mode.",
-            message.chat.id,
-            msg.message_id
-        )
-        time.sleep(2)
+    msg = bot.reply_to(message, f"Scanning @{username}...")
 
     profile = instagram.get_profile(username)
     if not profile:
         bot.edit_message_text("❌ Profile not found or private", message.chat.id, msg.message_id)
         return
 
-    if profile['private']:
-        bot.edit_message_text("🔒 Private profile - cannot analyze", message.chat.id, msg.message_id)
-        return
-
-    reports = {
-        **analyze_text(profile['name']),
-        **analyze_text(profile['bio'])
-    }
+    reports = analyze_text(profile['name']) | analyze_text(profile['bio'])
 
     response = f"*{profile['username']} Analysis*\n\n"
-    response += f"👤 *Name:* {profile['name'] or 'None'}\n"
-    response += f"📝 *Bio:* {profile['bio'] or 'None'}\n"
-    response += f"👥 *Followers:* {profile['followers']}\n"
-    response += f"🔄 *Following:* {profile['following']}\n\n"
-    response += "*Suggested Reports:*\n"
-
-    for cat, count in reports.items():
-        response += f"- {count}x {cat}\n"
+    response += f"👤 Name: {profile['name'] or 'None'}\n"
+    response += f"📝 Bio: {profile['bio'] or 'None'}\n"
+    response += f"👥 Followers: {profile['followers']:,}\n"
+    response += f"🔄 Following: {profile['following']:,}\n\n"
+    response += "*Reports:*\n" + "\n".join(f"- {count}x {cat}" for cat, count in reports.items())
 
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("View Profile", url=profile['url']))
@@ -266,53 +236,17 @@ def analyze_cmd(message):
 @bot.message_handler(commands=['instastatus'])
 def insta_status(message):
     if str(message.chat.id) != ADMIN_ID:
-        bot.reply_to(message, "⛔ Command restricted to admin")
         return
 
     status = instagram.get_status()
-    response = "📊 Instagram Connection Status:\n\n"
-
-    if status['anonymous']:
-        response += "🔓 Mode: Anonymous (no login credentials provided)\n"
-    else:
-        response += f"🔐 Mode: {'Logged In' if status['logged_in'] else 'Not Logged In'}\n"
-        response += f"🔢 Login Attempts: {status['attempts']}/3\n"
-
+    response = "📊 Instagram Status:\n"
+    response += f"🔐 Logged In: {status['logged_in']}\n"
+    response += f"🔢 Attempts: {status['attempts']}/3\n"
     if status['last_error']:
-        response += f"\n❌ Last Error: {status['last_error']}\n"
-
-    response += "\nℹ️ Note: Anonymous mode has stricter rate limits"
-
+        response += f"❌ Last Error: {status['last_error']}\n"
     bot.reply_to(message, response)
 
-@bot.message_handler(commands=['broadcast'])
-def broadcast(message):
-    if str(message.chat.id) != ADMIN_ID:
-        return
-
-    text = message.text.replace('/broadcast', '').strip()
-    if not text:
-        bot.reply_to(message, "Usage: /broadcast message")
-        return
-
-    users = get_users()
-    for user in users:
-        try:
-            bot.send_message(user, text)
-            time.sleep(0.3)
-        except:
-            continue
-
-    bot.reply_to(message, f"Broadcast sent to {len(users)} users")
-
-@bot.callback_query_handler(func=lambda call: True)
-def handle_errors(call):
-    try:
-        bot.answer_callback_query(call.id)
-    except:
-        pass
-
-# Start the bot with conflict prevention
+# Start bot
 def polling():
     while True:
         try:
