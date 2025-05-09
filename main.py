@@ -40,7 +40,7 @@ FORCE_JOIN_CHANNEL = os.getenv("FORCE_JOIN_CHANNEL")
 ADMIN_ID = os.getenv("ADMIN_ID")
 
 bot = telebot.TeleBot(API_TOKEN)
-bot.remove_webhook()  # Clear webhook if previously set (ensure polling mode)
+bot.remove_webhook()
 
 # In-memory user storage
 user_ids = set()
@@ -71,7 +71,10 @@ def check_keywords(text, keywords):
 
 def analyze_profile(profile_info):
     reports = defaultdict(int)
-    profile_texts = [profile_info.get("username", ""), profile_info.get("biography", "")]
+    profile_texts = [
+        profile_info.get("username", ""),
+        profile_info.get("biography", ""),
+    ]
 
     for text in profile_texts:
         for category, keywords in report_keywords.items():
@@ -265,8 +268,16 @@ def help_callback(call):
     bot.answer_callback_query(call.id, text=help_text)
     bot.send_message(call.from_user.id, help_text, parse_mode='MarkdownV2')
 
-# === Start Polling (main entry point) ===
+# === Keep Bot Running ===
+def start_polling():
+    try:
+        bot.polling(none_stop=True)
+    except Exception as e:
+        logging.error(f"Polling error: {e}")
+
 if __name__ == "__main__":
     print("Starting the bot...")
     logging.info("Bot started.")
-    bot.polling(none_stop=True)
+    t = Thread(target=start_polling)
+    t.start()
+    t.join()  # Prevents container from exiting
