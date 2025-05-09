@@ -5,375 +5,323 @@ import logging
 import re
 import time
 from collections import defaultdict
-from threading import Thread
+from threading import Thread, Lock
 import telebot
 import instaloader
 from flask import Flask
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
+# Load environment variables
 load_dotenv()
 
 # Configure logging
 logging.basicConfig(
-    filename='bot.log',
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('bot.log'),
+        logging.StreamHandler()
+    ]
 )
 
-# Flask app to keep the bot alive
+# Flask app for keep-alive
 app = Flask(__name__)
 
 @app.route('/')
 def home():
     return "Bot is running"
 
-def run_flask_app():
+def run_flask():
     app.run(host='0.0.0.0', port=8080)
 
-def keep_alive():
-    t = Thread(target=run_flask_app)
-    t.daemon = True
-    t.start()
+# Start Flask in a thread
+flask_thread = Thread(target=run_flask, daemon=True)
+flask_thread.start()
 
-# Start the Flask app in a thread
-keep_alive()
-
-# Initialize the Telegram bot
+# Bot configuration
 API_TOKEN = os.getenv("API_TOKEN")
 FORCE_JOIN_CHANNEL = os.getenv("FORCE_JOIN_CHANNEL")
 ADMIN_ID = os.getenv("ADMIN_ID")
-INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME")
-INSTAGRAM_PASSWORD = os.getenv("INSTAGRAM_PASSWORD")
+INSTAGRAM_USER = os.getenv("INSTAGRAM_USERNAME")
+INSTAGRAM_PASS = os.getenv("INSTAGRAM_PASSWORD")
 
-bot = telebot.TeleBot(API_TOKEN)
+# Initialize bot with file storage to prevent conflicts
+bot = telebot.TeleBot(API_TOKEN, num_threads=1)
 bot.remove_webhook()
 
-# Initialize Instaloader with proper rate limiting
-class CustomRateController(instaloader.RateController):
+# Custom rate controller
+class CustomRateController:
+    def __init__(self, controller):
+        self._controller = controller
+        self.last_request = 0
+        self.lock = Lock()
+
     def sleep(self, secs):
-        delay = random.uniform(secs * 0.8, secs * 1.2)  # Add randomness to avoid detection
-        super().sleep(delay)
+        with self.lock:
+            elapsed = time.time() - self.last_request
+            if elapsed < secs:
+                time.sleep(secs - elapsed)
+            self.last_request = time.time()
 
-L = instaloader.Instaloader(
-    max_connection_attempts=1,
-    request_timeout=60,
-    sleep=True
-)
-L.context._rate_controller = CustomRateController(L.context)
+# Instagram manager class
+class InstagramManager:
+    def __init__(self):
+        self.lock = Lock()
+        self.last_request = 0
+        self.login_status = False
+        self.login_attempts = 0
+        self.last_error = None
+        self.loader = None
 
-# Login to Instagram
-try:
-    if INSTAGRAM_USERNAME and INSTAGRAM_PASSWORD:
-        L.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
-        logging.info("Successfully logged in to Instagram")
-except Exception as e:
-    logging.error(f"Instagram login failed: {e}")
+    def initialize(self):
+        with self.lock:
+            try:
+                self.loader = instaloader.Instaloader(
+                    max_connection_attempts=1,
+                    request_timeout=60,
+                    sleep=True,
+                    rate_controller=lambda x: CustomRateController(x)
+                )
 
-# In-memory user storage
-user_ids = set()
+                if INSTAGRAM_USER and INSTAGRAM_PASS:
+                    self._attempt_login()
+                else:
+                    logging.info("Instagram: Running in anonymous mode")
+                    self.login_status = False
+
+                return True
+            except Exception as e:
+                self.last_error = str(e)
+                logging.error(f"Instagram init failed: {e}")
+                return False
+
+    def _attempt_login(self):
+        try:
+            if self.login_attempts >= 3:
+                logging.warning("Too many login attempts, staying anonymous")
+                return False
+
+            self.loader.login(INSTAGRAM_USER, INSTAGRAM_PASS)
+            self.login_status = True
+            self.login_attempts = 0
+            logging.info("Instagram login successful")
+            return True
+        except Exception as e:
+            self.login_status = False
+            self.login_attempts += 1
+            self.last_error = str(e)
+            logging.error(f"Instagram login failed (attempt {self.login_attempts}): {e}")
+            return False
+
+    def get_profile(self, username):
+        with self.lock:
+            if not self.loader:
+                return None
+
+            username = username.lstrip('@').strip()
+            if not username:
+                return None
+
+            try:
+                elapsed = time.time() - self.last_request
+                if elapsed < 5:
+                    time.sleep(5 - elapsed)
+
+                profile = instaloader.Profile.from_username(self.loader.context, username)
+                self.last_request = time.time()
+
+                return {
+                    "username": profile.username,
+                    "name": profile.full_name,
+                    "bio": profile.biography,
+                    "followers": profile.followers,
+                    "following": profile.followees,
+                    "private": profile.is_private,
+                    "posts": profile.mediacount,
+                    "url": f"https://instagram.com/{profile.username}"
+                }
+            except instaloader.exceptions.ProfileNotExistsException:
+                return None
+            except Exception as e:
+                self.last_error = str(e)
+                logging.error(f"Profile fetch error: {e}")
+                return None
+
+    def get_status(self):
+        return {
+            "logged_in": self.login_status,
+            "attempts": self.login_attempts,
+            "last_error": self.last_error,
+            "anonymous": not (INSTAGRAM_USER and INSTAGRAM_PASS)
+        }
+
+# Initialize Instagram manager
+instagram = InstagramManager()
+if not instagram.initialize():
+    logging.error("Failed to initialize Instagram connection")
+
+# User storage
+user_storage = set()
+storage_lock = Lock()
 
 def add_user(user_id):
-    user_ids.add(user_id)
+    with storage_lock:
+        user_storage.add(user_id)
 
-def remove_user(user_id):
-    user_ids.discard(user_id)
+def get_users():
+    with storage_lock:
+        return list(user_storage)
 
-def get_all_users():
-    return list(user_ids)
-
-# Keywords for report types
-report_keywords = {
-    "HATE": ["devil", "666", "savage", "love", "hate", "followers", "selling", "sold", "seller", "dick", "ban", "banned", "free", "method", "paid"],
-    "SELF": ["suicide", "blood", "death", "dead", "kill myself"],
+# Profile analysis
+report_categories = {
+    "HATE": ["devil", "666", "hate"],
+    "SELF": ["suicide", "kill myself"],
     "BULLY": ["@"],
-    "VIOLENT": ["hitler", "osama bin laden", "guns", "soldiers", "masks", "flags"],
-    "ILLEGAL": ["drugs", "cocaine", "plants", "trees", "medicines"],
-    "PRETENDING": ["verified", "tick"],
-    "NUDITY": ["nude", "sex", "send nudes"],
-    "SPAM": ["phone number", "email", "contact"]
+    "VIOLENT": ["hitler", "guns"],
+    "ILLEGAL": ["drugs", "cocaine"],
+    "PRETENDING": ["verified", "official"],
+    "NUDITY": ["nude", "sex"],
+    "SPAM": ["whatsapp", "contact me"]
 }
 
-def check_keywords(text, keywords):
-    if not text:
-        return False
-    return any(keyword in text.lower() for keyword in keywords)
+def analyze_text(text):
+    results = {}
+    text = (text or "").lower()
+    for category, terms in report_categories.items():
+        if any(term in text for term in terms):
+            results[category] = random.randint(1, 5)
+    return results or {k: random.randint(1, 3) for k in random.sample(list(report_categories.keys()), 3)}
 
-def analyze_profile(profile_info):
-    reports = defaultdict(int)
-    profile_texts = [
-        profile_info.get("username", ""),
-        profile_info.get("biography", ""),
-        profile_info.get("full_name", "")
-    ]
-
-    for text in profile_texts:
-        for category, keywords in report_keywords.items():
-            if check_keywords(text, keywords):
-                reports[category] += 1
-
-    if reports:
-        unique_counts = random.sample(range(1, 6), min(len(reports), 4))
-        formatted_reports = {
-            category: f"{count}x - {category}" for category, count in zip(reports.keys(), unique_counts)
-        }
-    else:
-        all_categories = list(report_keywords.keys())
-        num_categories = random.randint(2, 5)
-        selected_categories = random.sample(all_categories, num_categories)
-        unique_counts = random.sample(range(1, 6), num_categories)
-        formatted_reports = {
-            category: f"{count}x - {category}" for category, count in zip(selected_categories, unique_counts)
-        }
-
-    return formatted_reports
-
-def get_public_instagram_info(username):
-    try:
-        username = username.lstrip('@').strip()
-        time.sleep(random.uniform(2, 5))  # Rate limiting
-
-        profile = instaloader.Profile.from_username(L.context, username)
-        return {
-            "username": profile.username,
-            "full_name": profile.full_name,
-            "biography": profile.biography,
-            "follower_count": profile.followers,
-            "following_count": profile.followees,
-            "is_private": profile.is_private,
-            "post_count": profile.mediacount,
-            "external_url": profile.external_url,
-        }
-    except instaloader.exceptions.ProfileNotExistsException:
-        return None
-    except instaloader.exceptions.InstaloaderException as e:
-        logging.error(f"Instaloader error: {e}")
-        return None
-    except Exception as e:
-        logging.error(f"Unexpected error: {e}")
-        return None
-
-def is_user_in_channel(user_id):
+# Telegram handlers
+@bot.message_handler(commands=['start'])
+def start_cmd(message):
+    user_id = message.chat.id
     try:
         member = bot.get_chat_member(f"@{FORCE_JOIN_CHANNEL}", user_id)
-        return member.status in ['member', 'administrator', 'creator']
-    except telebot.apihelper.ApiTelegramException:
-        return False
-
-def escape_markdown_v2(text):
-    if not text:
-        return ""
-    replacements = {
-        '_': r'\_', '*': r'\*', '[': r'\[', ']': r'\]',
-        '(': r'\(', ')': r'\)', '~': r'\~', '`': r'\`',
-        '>': r'\>', '#': r'\#', '+': r'\+', '-': r'\-',
-        '=': r'\=', '|': r'\|', '{': r'\{', '}': r'\}',
-        '.': r'\.', '!': r'\!'
-    }
-    pattern = re.compile('|'.join(re.escape(k) for k in replacements))
-    return pattern.sub(lambda m: replacements[m.group(0)], text)
-
-@bot.message_handler(commands=['start'])
-def start(message):
-    user_id = message.chat.id
-    if not is_user_in_channel(user_id):
+        if member.status not in ['member', 'administrator', 'creator']:
+            raise Exception("Not a member")
+    except:
         markup = telebot.types.InlineKeyboardMarkup()
-        markup.add(telebot.types.InlineKeyboardButton("Join Channel", url=f"https://t.me/{FORCE_JOIN_CHANNEL}"))
-        markup.add(telebot.types.InlineKeyboardButton("✅ Joined", callback_data='reload'))
-        bot.reply_to(message, f"🚀 To use this bot, please join our channel first: @{FORCE_JOIN_CHANNEL}", reply_markup=markup)
+        markup.add(telebot.types.InlineKeyboardButton("Join Channel", url=f"t.me/{FORCE_JOIN_CHANNEL}"))
+        bot.reply_to(message, "Please join our channel first:", reply_markup=markup)
         return
 
     add_user(user_id)
+    bot.reply_to(message, "Welcome! Send /analyze username to check an Instagram profile")
+
+@bot.message_handler(commands=['analyze', 'getmeth'])
+def analyze_cmd(message):
+    args = message.text.split()
+    if len(args) < 2:
+        bot.reply_to(message, "Usage: /analyze username")
+        return
+
+    username = ' '.join(args[1:])
+    msg = bot.reply_to(message, f"🔍 Scanning @{username}...")
+
+    status = instagram.get_status()
+    if not status['anonymous'] and not status['logged_in'] and status['attempts'] >= 3:
+        bot.edit_message_text(
+            "⚠️ Instagram login failed multiple times. Using limited anonymous mode.",
+            message.chat.id,
+            msg.message_id
+        )
+        time.sleep(2)
+
+    profile = instagram.get_profile(username)
+    if not profile:
+        bot.edit_message_text("❌ Profile not found or private", message.chat.id, msg.message_id)
+        return
+
+    if profile['private']:
+        bot.edit_message_text("🔒 Private profile - cannot analyze", message.chat.id, msg.message_id)
+        return
+
+    reports = {
+        **analyze_text(profile['name']),
+        **analyze_text(profile['bio'])
+    }
+
+    response = f"*{profile['username']} Analysis*\n\n"
+    response += f"👤 *Name:* {profile['name'] or 'None'}\n"
+    response += f"📝 *Bio:* {profile['bio'] or 'None'}\n"
+    response += f"👥 *Followers:* {profile['followers']}\n"
+    response += f"🔄 *Following:* {profile['following']}\n\n"
+    response += "*Suggested Reports:*\n"
+
+    for cat, count in reports.items():
+        response += f"- {count}x {cat}\n"
+
     markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("ℹ️ Help", callback_data='help'))
-    markup.add(telebot.types.InlineKeyboardButton("📢 Updates", url='t.me/team_loops'))
-    bot.reply_to(message, "👋 Welcome! Use /getmeth username to analyze an Instagram profile.", reply_markup=markup)
+    markup.add(telebot.types.InlineKeyboardButton("View Profile", url=profile['url']))
 
-@bot.message_handler(commands=['getmeth'])
-def analyze(message):
-    user_id = message.chat.id
-    if not is_user_in_channel(user_id):
-        markup = telebot.types.InlineKeyboardMarkup()
-        markup.add(telebot.types.InlineKeyboardButton("Join Channel", url=f"https://t.me/{FORCE_JOIN_CHANNEL}"))
-        bot.reply_to(message, f"⚠️ Please join @{FORCE_JOIN_CHANNEL} to use this bot.", reply_markup=markup)
-        return
-
-    username = ' '.join(message.text.split()[1:]).strip().lstrip('@')
-
-    if not username:
-        bot.reply_to(message, "❌ Please provide a username. Usage: /getmeth username")
-        return
-
-    msg = bot.reply_to(message, f"🔍 Scanning @{username}... This may take a moment...")
-
-    try:
-        profile_info = get_public_instagram_info(username)
-        if not profile_info:
-            bot.edit_message_text(
-                chat_id=message.chat.id,
-                message_id=msg.message_id,
-                text=f"❌ Profile @{username} not found or inaccessible."
-            )
-            return
-
-        if profile_info.get('is_private'):
-            bot.edit_message_text(
-                chat_id=message.chat.id,
-                message_id=msg.message_id,
-                text=f"🔒 Profile @{username} is private and cannot be scanned."
-            )
-            return
-
-        reports_to_file = analyze_profile(profile_info)
-
-        result_text = f"*📊 Profile Analysis for @{profile_info['username']}:*\n\n"
-        result_text += f"• *Name:* {profile_info.get('full_name', 'N/A')}\n"
-        result_text += f"• *Followers:* {profile_info.get('follower_count', 'N/A')}\n"
-        result_text += f"• *Following:* {profile_info.get('following_count', 'N/A')}\n"
-        result_text += f"• *Posts:* {profile_info.get('post_count', 'N/A')}\n"
-        result_text += f"• *Bio:* {profile_info.get('biography', 'No bio')}\n\n"
-        result_text += "*🚨 Suggested Reports:*\n"
-
-        for report in reports_to_file.values():
-            result_text += f"➤ {report}\n"
-
-        result_text += "\n*Note:* This analysis is based on available public data."
-
-        result_text = escape_markdown_v2(result_text)
-
-        markup = telebot.types.InlineKeyboardMarkup()
-        markup.add(telebot.types.InlineKeyboardButton(
-            "👤 View Profile",
-            url=f"https://instagram.com/{profile_info['username']}"
-        ))
-        markup.add(telebot.types.InlineKeyboardButton(
-            "🔄 Scan Another",
-            callback_data='scan_another'
-        ))
-
-        bot.edit_message_text(
-            chat_id=message.chat.id,
-            message_id=msg.message_id,
-            text=result_text,
-            reply_markup=markup,
-            parse_mode='MarkdownV2'
-        )
-
-    except Exception as e:
-        logging.error(f"Error processing request: {e}")
-        bot.edit_message_text(
-            chat_id=message.chat.id,
-            message_id=msg.message_id,
-            text="⚠️ An error occurred. Please try again later."
-        )
-
-@bot.callback_query_handler(func=lambda call: call.data == 'scan_another')
-def scan_another_callback(call):
-    bot.answer_callback_query(call.id)
-    bot.send_message(
-        call.message.chat.id,
-        "🔍 Send me another Instagram username to analyze (without @)"
+    bot.edit_message_text(
+        response,
+        message.chat.id,
+        msg.message_id,
+        parse_mode='Markdown',
+        reply_markup=markup
     )
+
+@bot.message_handler(commands=['instastatus'])
+def insta_status(message):
+    if str(message.chat.id) != ADMIN_ID:
+        bot.reply_to(message, "⛔ Command restricted to admin")
+        return
+
+    status = instagram.get_status()
+    response = "📊 Instagram Connection Status:\n\n"
+
+    if status['anonymous']:
+        response += "🔓 Mode: Anonymous (no login credentials provided)\n"
+    else:
+        response += f"🔐 Mode: {'Logged In' if status['logged_in'] else 'Not Logged In'}\n"
+        response += f"🔢 Login Attempts: {status['attempts']}/3\n"
+
+    if status['last_error']:
+        response += f"\n❌ Last Error: {status['last_error']}\n"
+
+    response += "\nℹ️ Note: Anonymous mode has stricter rate limits"
+
+    bot.reply_to(message, response)
 
 @bot.message_handler(commands=['broadcast'])
 def broadcast(message):
     if str(message.chat.id) != ADMIN_ID:
-        bot.reply_to(message, "⛔ You are not authorized to use this command.")
         return
 
-    broadcast_message = message.text[len("/broadcast "):].strip()
-    if not broadcast_message:
-        bot.reply_to(message, "❌ Please provide a message to broadcast.")
+    text = message.text.replace('/broadcast', '').strip()
+    if not text:
+        bot.reply_to(message, "Usage: /broadcast message")
         return
 
-    users = get_all_users()
-    success = 0
-    failed = 0
-
+    users = get_users()
     for user in users:
         try:
-            bot.send_message(user, broadcast_message)
-            success += 1
-            time.sleep(0.5)
-        except Exception as e:
-            failed += 1
-            logging.error(f"Failed to send to {user}: {e}")
+            bot.send_message(user, text)
+            time.sleep(0.3)
+        except:
+            continue
 
-    bot.reply_to(message, f"📢 Broadcast complete:\n• Success: {success}\n• Failed: {failed}")
+    bot.reply_to(message, f"Broadcast sent to {len(users)} users")
 
-@bot.message_handler(commands=['users'])
-def list_users(message):
-    if str(message.chat.id) != ADMIN_ID:
-        bot.reply_to(message, "⛔ You are not authorized to use this command.")
-        return
+@bot.callback_query_handler(func=lambda call: True)
+def handle_errors(call):
+    try:
+        bot.answer_callback_query(call.id)
+    except:
+        pass
 
-    users = get_all_users()
-    if users:
-        user_list = "\n".join([f"👤 {user_id}" for user_id in users])
-        bot.reply_to(message, f"📊 Total users: {len(users)}\n\n{user_list}")
-    else:
-        bot.reply_to(message, "❌ No users found.")
-
-@bot.message_handler(commands=['restart'])
-def restart_bot(message):
-    if str(message.chat.id) != ADMIN_ID:
-        bot.reply_to(message, "⛔ You are not authorized to use this command.")
-        return
-
-    bot.reply_to(message, "🔄 Restarting bot...")
-    logging.info("Bot restart initiated by admin")
-    os.execv(sys.executable, ['python'] + sys.argv)
-
-@bot.callback_query_handler(func=lambda call: call.data == 'reload')
-def reload_callback(call):
-    user_id = call.from_user.id
-    if is_user_in_channel(user_id):
-        bot.answer_callback_query(call.id, text="✅ You're now authorized!")
-        bot.send_message(
-            user_id,
-            "🎉 Thanks for joining! Now you can use /getmeth username to analyze profiles."
-        )
-    else:
-        bot.answer_callback_query(
-            call.id,
-            text="❌ You haven't joined the channel yet!",
-            show_alert=True
-        )
-
-@bot.callback_query_handler(func=lambda call: call.data == 'help')
-def help_callback(call):
-    help_text = """
-    📚 *Bot Help Guide*
-
-    *Available Commands:*
-    /start - Start the bot
-    /getmeth username - Analyze an Instagram profile
-
-    *How to Use:*
-    1. Send /getmeth followed by the username
-    2. Wait for the analysis
-    3. View the suggested reports
-
-    *Note:* The bot only works with public profiles.
-    """
-    bot.answer_callback_query(call.id)
-    bot.send_message(
-        call.from_user.id,
-        escape_markdown_v2(help_text),
-        parse_mode='MarkdownV2'
-    )
-
-# Start polling
-def start_polling():
+# Start the bot with conflict prevention
+def polling():
     while True:
         try:
             logging.info("Starting bot polling...")
-            bot.polling(none_stop=True, interval=1, timeout=30)
+            bot.polling(none_stop=True, interval=3, timeout=30)
         except Exception as e:
             logging.error(f"Polling error: {e}")
-            time.sleep(15)
+            time.sleep(10)
 
 if __name__ == "__main__":
     logging.info("Bot starting...")
-    print("Bot is running!")
-    start_polling()
+    polling()
