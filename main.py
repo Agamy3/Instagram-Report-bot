@@ -28,6 +28,7 @@ def run_flask_app():
 
 def keep_alive():
     t = Thread(target=run_flask_app)
+    t.daemon = True
     t.start()
 
 # Start the Flask app in a thread
@@ -41,7 +42,7 @@ ADMIN_ID = os.getenv("ADMIN_ID")
 bot = telebot.TeleBot(API_TOKEN)
 bot.remove_webhook()
 
-# In-memory list to store user IDs
+# In-memory user storage
 user_ids = set()
 
 def add_user(user_id):
@@ -53,7 +54,7 @@ def remove_user(user_id):
 def get_all_users():
     return list(user_ids)
 
-# List of keywords for different report categories
+# Keywords for report types
 report_keywords = {
     "HATE": ["devil", "666", "savage", "love", "hate", "followers", "selling", "sold", "seller", "dick", "ban", "banned", "free", "method", "paid"],
     "SELF": ["suicide", "blood", "death", "dead", "kill myself"],
@@ -100,7 +101,7 @@ def get_public_instagram_info(username):
     L = instaloader.Instaloader()
     try:
         profile = instaloader.Profile.from_username(L.context, username)
-        info = {
+        return {
             "username": profile.username,
             "full_name": profile.full_name,
             "biography": profile.biography,
@@ -110,7 +111,6 @@ def get_public_instagram_info(username):
             "post_count": profile.mediacount,
             "external_url": profile.external_url,
         }
-        return info
     except instaloader.exceptions.ProfileNotExistsException:
         return None
     except instaloader.exceptions.InstaloaderException as e:
@@ -125,7 +125,6 @@ def is_user_in_channel(user_id):
         return False
 
 def escape_markdown_v2(text):
-    # Escape special MarkdownV2 characters
     replacements = {
         '_': r'\_', '*': r'\*', '[': r'\[', ']': r'\]',
         '(': r'\(', ')': r'\)', '~': r'\~', '`': r'\`',
@@ -133,8 +132,8 @@ def escape_markdown_v2(text):
         '=': r'\=', '|': r'\|', '{': r'\{', '}': r'\}',
         '.': r'\.', '!': r'\!'
     }
-    pattern = re.compile('|'.join(re.escape(key) for key in replacements.keys()))
-    return pattern.sub(lambda x: replacements[x.group(0)], text)
+    pattern = re.compile('|'.join(re.escape(k) for k in replacements))
+    return pattern.sub(lambda m: replacements[m.group(0)], text)
 
 @bot.message_handler(commands=['start'])
 def start(message):
@@ -146,7 +145,7 @@ def start(message):
         bot.reply_to(message, f"Please join @{FORCE_JOIN_CHANNEL} to use this bot.", reply_markup=markup)
         return
 
-    add_user(user_id)  # Add user to the list
+    add_user(user_id)
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("Help", callback_data='help'))
     markup.add(telebot.types.InlineKeyboardButton("Update Channel", url='t.me/team_loops'))
@@ -159,9 +158,9 @@ def analyze(message):
         bot.reply_to(message, f"Please join @{FORCE_JOIN_CHANNEL} to use this bot.")
         return
 
-    username = message.text.split()[1:]  # Get username from command
+    username = message.text.split()[1:]
     if not username:
-        bot.reply_to(message, "😾 Worong method Please send like this /getmeth Username without @ & < >  Send your Target username.")
+        bot.reply_to(message, "😾 Wrong method. Use /getmeth username (without @, <, >).")
         return
 
     username = ' '.join(username)
@@ -184,7 +183,6 @@ def analyze(message):
             result_text += f"• {report}\n"
         result_text += "\n*Note: This method is based on available data and may not be fully accurate.*\n"
 
-        # Escape special characters for MarkdownV2
         result_text = escape_markdown_v2(result_text)
 
         markup = telebot.types.InlineKeyboardMarkup()
@@ -232,7 +230,7 @@ def remove_user_command(message):
         bot.reply_to(message, "You are not authorized to use this command.")
         return
 
-    user_id = message.text.split()[1:]  # Get user ID from command
+    user_id = message.text.split()[1:]
     if not user_id:
         bot.reply_to(message, "Please provide a user ID.")
         return
@@ -266,16 +264,20 @@ def help_callback(call):
     help_text += "/getmeth <username> - Analyze an Instagram profile.\n"
     help_text += "Make sure you are a member of the channel to use this bot."
 
-    # Escape special characters for MarkdownV2
     help_text = escape_markdown_v2(help_text)
-
-    bot.answer_callback_query(call.id, text=escape_markdown_v2(help_text))
+    bot.answer_callback_query(call.id, text=help_text)
     bot.send_message(call.from_user.id, help_text, parse_mode='MarkdownV2')
+
+# === Keep Bot Running ===
+def start_polling():
+    try:
+        bot.polling(none_stop=True)
+    except Exception as e:
+        logging.error(f"Polling error: {e}")
 
 if __name__ == "__main__":
     print("Starting the bot...")
     logging.info("Bot started.")
-
-    # Start the bot polling in a separate thread
-    t = Thread(target=bot.polling)
+    t = Thread(target=start_polling)
     t.start()
+    t.join()  # Prevents container from exiting
