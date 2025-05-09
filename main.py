@@ -40,6 +40,7 @@ ADMIN_ID = os.getenv("ADMIN_ID")
 
 bot = telebot.TeleBot(API_TOKEN)
 bot.remove_webhook()
+bot.infinity_polling()
 
 # In-memory list to store user IDs
 user_ids = set()
