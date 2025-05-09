@@ -49,16 +49,18 @@ INSTAGRAM_PASSWORD = os.getenv("INSTAGRAM_PASSWORD")
 bot = telebot.TeleBot(API_TOKEN)
 bot.remove_webhook()
 
-# Initialize Instaloader with rate limiting
+# Initialize Instaloader with proper rate limiting
+class CustomRateController(instaloader.RateController):
+    def sleep(self, secs):
+        delay = random.uniform(secs * 0.8, secs * 1.2)  # Add randomness to avoid detection
+        super().sleep(delay)
+
 L = instaloader.Instaloader(
     max_connection_attempts=1,
     request_timeout=60,
-    rate_controller=lambda: instaloader.RateController(
-        L,
-        sleep=True,
-        sleep_seconds=random.uniform(2, 5)
-    )
+    sleep=True
 )
+L.context._rate_controller = CustomRateController(L.context)
 
 # Login to Instagram
 try:
@@ -128,11 +130,8 @@ def analyze_profile(profile_info):
 
 def get_public_instagram_info(username):
     try:
-        # Clean the username input
         username = username.lstrip('@').strip()
-
-        # Add delay to prevent rate limiting
-        time.sleep(random.uniform(2, 5))
+        time.sleep(random.uniform(2, 5))  # Rate limiting
 
         profile = instaloader.Profile.from_username(L.context, username)
         return {
@@ -199,14 +198,12 @@ def analyze(message):
         bot.reply_to(message, f"⚠️ Please join @{FORCE_JOIN_CHANNEL} to use this bot.", reply_markup=markup)
         return
 
-    # Extract and clean username
     username = ' '.join(message.text.split()[1:]).strip().lstrip('@')
 
     if not username:
         bot.reply_to(message, "❌ Please provide a username. Usage: /getmeth username")
         return
 
-    # Send initial response
     msg = bot.reply_to(message, f"🔍 Scanning @{username}... This may take a moment...")
 
     try:
@@ -229,7 +226,6 @@ def analyze(message):
 
         reports_to_file = analyze_profile(profile_info)
 
-        # Prepare the result message
         result_text = f"*📊 Profile Analysis for @{profile_info['username']}:*\n\n"
         result_text += f"• *Name:* {profile_info.get('full_name', 'N/A')}\n"
         result_text += f"• *Followers:* {profile_info.get('follower_count', 'N/A')}\n"
@@ -243,10 +239,8 @@ def analyze(message):
 
         result_text += "\n*Note:* This analysis is based on available public data."
 
-        # Escape markdown special characters
         result_text = escape_markdown_v2(result_text)
 
-        # Create inline keyboard
         markup = telebot.types.InlineKeyboardMarkup()
         markup.add(telebot.types.InlineKeyboardButton(
             "👤 View Profile",
@@ -257,7 +251,6 @@ def analyze(message):
             callback_data='scan_another'
         ))
 
-        # Edit the original message with results
         bot.edit_message_text(
             chat_id=message.chat.id,
             message_id=msg.message_id,
@@ -282,7 +275,6 @@ def scan_another_callback(call):
         "🔍 Send me another Instagram username to analyze (without @)"
     )
 
-# Admin commands
 @bot.message_handler(commands=['broadcast'])
 def broadcast(message):
     if str(message.chat.id) != ADMIN_ID:
@@ -302,7 +294,7 @@ def broadcast(message):
         try:
             bot.send_message(user, broadcast_message)
             success += 1
-            time.sleep(0.5)  # Rate limiting
+            time.sleep(0.5)
         except Exception as e:
             failed += 1
             logging.error(f"Failed to send to {user}: {e}")
@@ -332,7 +324,6 @@ def restart_bot(message):
     logging.info("Bot restart initiated by admin")
     os.execv(sys.executable, ['python'] + sys.argv)
 
-# Callback handlers
 @bot.callback_query_handler(func=lambda call: call.data == 'reload')
 def reload_callback(call):
     user_id = call.from_user.id
@@ -380,7 +371,7 @@ def start_polling():
             bot.polling(none_stop=True, interval=1, timeout=30)
         except Exception as e:
             logging.error(f"Polling error: {e}")
-            time.sleep(15)  # Wait before restarting
+            time.sleep(15)
 
 if __name__ == "__main__":
     logging.info("Bot starting...")
