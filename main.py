@@ -24,8 +24,8 @@ def home():
     return "I'm alive"
 
 def run_flask_app():
-port = int(os.getenv("PORT", 8080))  # Use Railway's assigned port or 8080 by default
-app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=8080)
+
 def keep_alive():
     t = Thread(target=run_flask_app)
     t.start()
@@ -40,7 +40,6 @@ ADMIN_ID = os.getenv("ADMIN_ID")
 
 bot = telebot.TeleBot(API_TOKEN)
 bot.remove_webhook()
-
 
 # In-memory list to store user IDs
 user_ids = set()
