@@ -38,9 +38,19 @@ keep_alive()
 API_TOKEN = os.getenv("API_TOKEN")
 FORCE_JOIN_CHANNEL = os.getenv("FORCE_JOIN_CHANNEL")
 ADMIN_ID = os.getenv("ADMIN_ID")
+INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME")
+INSTAGRAM_PASSWORD = os.getenv("INSTAGRAM_PASSWORD")
 
 bot = telebot.TeleBot(API_TOKEN)
 bot.remove_webhook()
+
+# Initialize Instaloader with session
+L = instaloader.Instaloader()
+try:
+    if INSTAGRAM_USERNAME and INSTAGRAM_PASSWORD:
+        L.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
+except Exception as e:
+    logging.error(f"Instagram login failed: {e}")
 
 # In-memory user storage
 user_ids = set()
@@ -98,8 +108,12 @@ def analyze_profile(profile_info):
     return formatted_reports
 
 def get_public_instagram_info(username):
-    L = instaloader.Instaloader()
     try:
+        # Clean the username
+        username = username.strip().lower()
+        if username.startswith('@'):
+            username = username[1:]
+
         profile = instaloader.Profile.from_username(L.context, username)
         return {
             "username": profile.username,
@@ -112,16 +126,21 @@ def get_public_instagram_info(username):
             "external_url": profile.external_url,
         }
     except instaloader.exceptions.ProfileNotExistsException:
+        logging.error(f"Profile {username} does not exist")
         return None
     except instaloader.exceptions.InstaloaderException as e:
-        logging.error(f"An error occurred: {e}")
+        logging.error(f"Instaloader error for {username}: {e}")
+        return None
+    except Exception as e:
+        logging.error(f"Unexpected error for {username}: {e}")
         return None
 
 def is_user_in_channel(user_id):
     try:
         member = bot.get_chat_member(f"@{FORCE_JOIN_CHANNEL}", user_id)
         return member.status in ['member', 'administrator', 'creator']
-    except telebot.apihelper.ApiTelegramException:
+    except telebot.apihelper.ApiTelegramException as e:
+        logging.error(f"Error checking channel membership: {e}")
         return False
 
 def escape_markdown_v2(text):
@@ -158,38 +177,54 @@ def analyze(message):
         bot.reply_to(message, f"Please join @{FORCE_JOIN_CHANNEL} to use this bot.")
         return
 
-    username = message.text.split()[1:]
-    if not username:
+    # Extract username from message
+    if len(message.text.split()) < 2:
         bot.reply_to(message, "😾 Wrong method. Use /getmeth username (without @, <, >).")
         return
 
-    username = ' '.join(username)
+    username = ' '.join(message.text.split()[1:]).strip()
+    if not username:
+        bot.reply_to(message, "😾 Please provide a valid username.")
+        return
+
+    # Remove any special characters
+    username = re.sub(r'[^a-zA-Z0-9_.]', '', username)
+
     bot.reply_to(message, f"🔍 Scanning Your Target Profile: {username}. Please wait...")
 
     profile_info = get_public_instagram_info(username)
-    if profile_info:
-        reports_to_file = analyze_profile(profile_info)
-        result_text = f"**Public Information for {username}:**\n"
-        result_text += f"Username: {profile_info.get('username', 'N/A')}\n"
-        result_text += f"Full Name: {profile_info.get('full_name', 'N/A')}\n"
-        result_text += f"Biography: {profile_info.get('biography', 'N/A')}\n"
-        result_text += f"Followers: {profile_info.get('follower_count', 'N/A')}\n"
-        result_text += f"Following: {profile_info.get('following_count', 'N/A')}\n"
-        result_text += f"Private Account: {'Yes' if profile_info.get('is_private') else 'No'}\n"
-        result_text += f"Posts: {profile_info.get('post_count', 'N/A')}\n"
-        result_text += f"External URL: {profile_info.get('external_url', 'N/A')}\n\n"
-        result_text += "Suggested Reports for Your Target:\n"
-        for report in reports_to_file.values():
-            result_text += f"• {report}\n"
-        result_text += "\n*Note: This method is based on available data and may not be fully accurate.*\n"
+    if profile_info is None:
+        bot.reply_to(message, f"❌ Profile @{username} not found or is private. Please check the username and try again.")
+        return
 
-        result_text = escape_markdown_v2(result_text)
+    if profile_info.get("is_private", True):
+        bot.reply_to(message, f"❌ Profile @{username} is private. Only public profiles can be analyzed.")
+        return
 
-        markup = telebot.types.InlineKeyboardMarkup()
-        markup.add(telebot.types.InlineKeyboardButton("Visit Target Profile", url=f"https://instagram.com/{profile_info['username']}"))
-        markup.add(telebot.types.InlineKeyboardButton("Developer", url='t.me/focro'))
+    reports_to_file = analyze_profile(profile_info)
+    result_text = f"**Public Information for {username}:**\n"
+    result_text += f"Username: {profile_info.get('username', 'N/A')}\n"
+    result_text += f"Full Name: {profile_info.get('full_name', 'N/A')}\n"
+    result_text += f"Biography: {profile_info.get('biography', 'N/A')}\n"
+    result_text += f"Followers: {profile_info.get('follower_count', 'N/A')}\n"
+    result_text += f"Following: {profile_info.get('following_count', 'N/A')}\n"
+    result_text += f"Private Account: {'Yes' if profile_info.get('is_private') else 'No'}\n"
+    result_text += f"Posts: {profile_info.get('post_count', 'N/A')}\n"
+    result_text += f"External URL: {profile_info.get('external_url', 'N/A')}\n\n"
+    result_text += "Suggested Reports for Your Target:\n"
+    for report in reports_to_file.values():
+        result_text += f"• {report}\n"
+    result_text += "\n*Note: This method is based on available data and may not be fully accurate.*\n"
 
-        bot.send_message(message.chat.id, result_text, reply_markup=markup, parse_mode='MarkdownV2')
+    result_text = escape_markdown_v2(result_text)
+
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("Visit Target Profile", url=f"https://instagram.com/{profile_info['username']}"))
+    markup.add(telebot.types.InlineKeyboardButton("Developer", url='t.me/focro'))
+
+    bot.send_message(message.chat.id, result_text, reply_markup=markup, parse_mode='MarkdownV2')
+
+# ... [rest of the code remains the same]
     else:
         bot.reply_to(message, f"❌ Profile {username} not found or an error occurred.")
 
